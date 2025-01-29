@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import case
 from datetime import datetime, timedelta
 import threading
 import uuid
@@ -16,12 +17,17 @@ PRIORITY = ['RUSH', 'HIGH', 'MEDIUM', 'LOW']
 # Render Task Model
 class RenderTask(db.Model):
     id = db.Column(db.String(36), primary_key=True)
-    status = db.Column(db.String(20), default='Pending')
+    status = db.Column(db.String(20), default='pending')
     priority = db.Column(db.String(20), default='MEDIUM')
     progress = db.Column(db.Float, default=0.0)
     created_at = db.Column(db.DateTime, default=datetime.now())
     updated_at = db.Column(db.DateTime, default=datetime.now())
     worker_id = db.Column(db.String(36), nullable=True)
+
+ordering = case(
+    {value: index for index, value in enumerate(PRIORITY)},
+    value=RenderTask.priority
+)
 
 # Worker Model
 class Worker(db.Model):
@@ -34,6 +40,8 @@ class Worker(db.Model):
 def check_worker_failures():
     failed_workers = Worker.query.filter(Worker.last_heartbeat < datetime.now() - timedelta(seconds=30)).all()
     print (time.ctime())
+    if not failed_workers:
+        worker_request_task('')
     for worker in failed_workers:
         # Task preemption or reassignment logic here
         worker_request_task(worker.id)
@@ -65,7 +73,6 @@ def create_render():
     
     new_task = RenderTask(
         id=task_id,
-        status='Pending',
         priority=priority
     )
     db.session.add(new_task)
@@ -111,10 +118,20 @@ def get_workers():
 # POST /api/workers/{id}/request-task - Get next available task
 @app.route('/api/workers/<worker_id>/request-task', methods=['POST'])
 def worker_request_task(worker_id):
-    noWorkers = Worker.query.filter(Worker.status == 'Ready' or Worker.status == 'Offline' or Worker.status == 'Busy').count()
-    if not noWorkers:
+    noWorkers = Worker.query.filter(Worker.status == 'Ready').count()
+
+    ## Need to check for RUSH task to preempt
+
+    # check to see if there are rendering tasks for this worker
+    renderingTask = RenderTask.query.filter(RenderTask.status == 'rendering' and RenderTask.worker_id == worker_id).first()
+    if renderingTask:
+        return jsonify({'message': 'Task is processing'}), 404
+    
+    if noWorkers == 0:
+        print('Creating new worker...')
+        worker_id = str(uuid.uuid4())
         new_worker = Worker(
-            id = str(uuid.uuid4()),
+            id = worker_id,
             status = 'Ready',
             last_heartbeat = datetime.now()
         )
@@ -125,13 +142,14 @@ def worker_request_task(worker_id):
     if not worker:
         return jsonify({'error': 'Worker not found'}), 404
 
-    # Get the next available task based on priority and preemption rules
-    task = RenderTask.query.filter(RenderTask.status == 'Pending').order_by(RenderTask.priority).first()
-    
+    # Get the next available task based on priority
+    task = RenderTask.query.filter(RenderTask.status == 'pending').order_by(ordering).first()
     if not task:
         return jsonify({'message': 'No available tasks'}), 404
     
-    task.status = 'Assigned'
+    print("Next priority: " + task.priority)
+    
+    task.status = 'rendering'
     task.worker_id = worker_id
     worker.status = 'Busy'
     worker.current_task_id = task.id
